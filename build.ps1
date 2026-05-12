@@ -179,10 +179,83 @@ try {
 }
 $bldDur = [int]((Get-Date) - $tBld).TotalSeconds
 
-# 8. Artifacts
+# 8. Build version stamping.
+# A human-readable BUILD_VERSION.txt at the top of the artifacts dir
+# captures the exact source state (engine SHA, eqlib pin + __ClientDate,
+# plugin SHA, build timestamp). Every emitted DLL/EXE also gets its
+# Windows VERSIONINFO patched via rcedit so Properties->Details shows
+# the same identifier without opening the file.
+function Get-RepoState {
+    param([string]$Dir)
+    if (-not (Test-Path (Join-Path $Dir '.git')) -and -not (Test-Path (Join-Path $Dir '.git/HEAD'))) { return $null }
+    Push-Location $Dir
+    try {
+        $sha    = (& $env_.GitExe rev-parse --short HEAD 2>$null).Trim()
+        $branch = (& $env_.GitExe rev-parse --abbrev-ref HEAD 2>$null).Trim()
+        $msg    = (& $env_.GitExe log -1 --format='%s' 2>$null).Trim()
+        if ($msg.Length -gt 80) { $msg = $msg.Substring(0,80) + '...' }
+        return [pscustomobject]@{ Dir=$Dir; Sha=$sha; Branch=$branch; Subject=$msg }
+    } finally { Pop-Location }
+}
+
+$engineState = Get-RepoState $engineDir
+$eqlibDir    = Join-Path $engineDir 'src\eqlib'
+$eqlibState  = Get-RepoState $eqlibDir
+$eqgameH     = Join-Path $eqlibDir 'include\eqlib\offsets\eqgame.h'
+$clientDate  = if (Test-Path $eqgameH) {
+    (Select-String -Path $eqgameH -Pattern '__ClientDate\s+([0-9u]+)' -EA 0 | Select-Object -First 1).Matches.Groups[1].Value
+} else { '<unknown>' }
+$clientStr   = if (Test-Path $eqgameH) {
+    (Select-String -Path $eqgameH -Pattern '__ExpectedVersionDate\s+"([^"]+)"' -EA 0 | Select-Object -First 1).Matches.Groups[1].Value
+} else { '<unknown>' }
+$pluginState = $null
+if (-not $EngineOnly -and $Plugin) {
+    $pluginState = Get-RepoState (Join-Path $env_.SrcRoot $Plugin)
+}
+
+$buildIdShort = "$stamp-$($engineState.Sha)-eq$($clientDate -replace 'u','')"
+$ver4 = "$($stamp.Substring(0,4)).$($stamp.Substring(4,2)).$($stamp.Substring(6,2)).$($clientDate -replace 'u','' | ForEach-Object { $_.Substring([Math]::Max(0,$_.Length-4)) })"
+
+$versionLines = @(
+    "MQ2 build manifest"
+    "===================="
+    "Build ID:        $buildIdShort"
+    "Win32 FileVer:   $ver4"
+    "Build timestamp: $stamp (UTC)"
+    "Target name:     $buildName"
+    "Preset:          $Preset"
+    "Configuration:   $Configuration"
+    ""
+    "EQ client target"
+    "----------------"
+    "__ClientDate:           $clientDate"
+    "__ExpectedVersionDate:  $clientStr"
+    "eqlib pin:              $($eqlibState.Sha)  ($($eqlibState.Subject))"
+    ""
+    "Source state"
+    "------------"
+    "macroquest engine:      $($engineState.Sha)  branch=$($engineState.Branch)"
+    "                        $($engineState.Subject)"
+)
+if ($pluginState) {
+    $versionLines += @(
+        "$Plugin plugin:        $($pluginState.Sha)  branch=$($pluginState.Branch)"
+        "                        $($pluginState.Subject)"
+    )
+}
+$versionText = ($versionLines -join "`r`n") + "`r`n"
+$versionFile = Join-Path $buildDir 'BUILD_VERSION.txt'
+[System.IO.File]::WriteAllText($versionFile, $versionText, [System.Text.UTF8Encoding]::new($false))
+Log "Wrote $versionFile"
+
+# 9. Artifacts
 $binDir = Join-Path $engineDir "build\bin\$($Configuration.ToLower())"
 if (-not (Test-Path $binDir)) { $binDir = Join-Path $engineDir "build\bin\release" }
 $artifactCount = 0
+$rcedit = Join-Path $scriptDir 'bin\rcedit.exe'
+$canStamp = Test-Path $rcedit
+if (-not $canStamp) { Log "rcedit.exe not at $rcedit -- skipping PE VERSIONINFO stamp" 'Yellow' }
+
 if (Test-Path $binDir) {
     $pattern = if ($EngineOnly -or -not $Plugin) { '*.dll','*.pdb','*.exe' } else { "$Plugin*.dll","$Plugin*.pdb" }
     foreach ($p in $pattern) {
@@ -190,6 +263,26 @@ if (Test-Path $binDir) {
             Copy-Item $_.FullName -Destination $artifactsDir -Force
             $artifactCount++
         }
+    }
+    # Also drop the version manifest alongside the binaries.
+    Copy-Item $versionFile -Destination $artifactsDir -Force
+
+    # Stamp PE VERSIONINFO on .dll/.exe artifacts.
+    if ($canStamp) {
+        $stampTargets = Get-ChildItem $artifactsDir -File -Include '*.dll','*.exe' -ErrorAction SilentlyContinue
+        $companyName  = "Krakty"
+        $description  = "MQ2-Krakty $buildName (eqlib $clientStr)"
+        foreach ($f in $stampTargets) {
+            & $rcedit $f.FullName `
+                --set-file-version    $ver4 `
+                --set-product-version $ver4 `
+                --set-version-string  FileDescription  $description `
+                --set-version-string  ProductName      "MQ2-Krakty" `
+                --set-version-string  CompanyName      $companyName `
+                --set-version-string  Comments         $buildIdShort `
+                --set-version-string  LegalCopyright   "GPLv2" 2>&1 | Out-Null
+        }
+        Log "Stamped $($stampTargets.Count) artifact(s) with FileVersion=$ver4 BuildId=$buildIdShort" 'Cyan'
     }
 }
 
