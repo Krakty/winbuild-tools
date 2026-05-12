@@ -269,7 +269,8 @@ if (Test-Path $binDir) {
 
     # Stamp PE VERSIONINFO on .dll/.exe artifacts.
     if ($canStamp) {
-        $stampTargets = Get-ChildItem $artifactsDir -File -Include '*.dll','*.exe' -ErrorAction SilentlyContinue
+        # -Include requires a wildcard path or -Recurse to be honored.
+        $stampTargets = Get-ChildItem (Join-Path $artifactsDir '*') -File -Include '*.dll','*.exe' -ErrorAction SilentlyContinue
         $companyName  = "Krakty"
         $description  = "MQ2-Krakty $buildName (eqlib $clientStr)"
         foreach ($f in $stampTargets) {
