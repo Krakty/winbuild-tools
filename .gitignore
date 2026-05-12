@@ -1,0 +1,4 @@
+*.log
+*.pdb
+*.swp
+.DS_Store
