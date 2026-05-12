@@ -156,14 +156,22 @@ if ($cfgRc -ne 0) {
 Log "Configure OK (${cfgDur}s)" 'Green'
 
 # 7. Build
-$parallelArgs = if ($Parallel -gt 0) { @('--parallel', $Parallel) } else { @('--parallel') }
-Log ("cmake --build build --config $Configuration " + ($parallelArgs -join ' ')) 'White'
+# Splat-through-scriptblock is unreliable across PS5.1/pwsh7 (the `@var`
+# splat operator binds to local scope, and Capture-Native's scriptblock
+# wraps in a different scope). Inline the call so the splat sees the
+# right scope.
+$parallelMsg = if ($Parallel -gt 0) { "--parallel $Parallel" } else { '--parallel' }
+Log "cmake --build build --config $Configuration $parallelMsg" 'White'
 $tBld = Get-Date
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 Push-Location $engineDir
 try {
-    Capture-Native { & cmake --build build --config $Configuration @parallelArgs } | Out-Null
+    if ($Parallel -gt 0) {
+        & cmake --build build --config $Configuration --parallel $Parallel 2>&1 | Tee-Object -FilePath $consoleLog -Append | Out-Null
+    } else {
+        & cmake --build build --config $Configuration --parallel 2>&1 | Tee-Object -FilePath $consoleLog -Append | Out-Null
+    }
     $bldRc = $LASTEXITCODE
 } finally {
     Pop-Location
