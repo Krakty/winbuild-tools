@@ -12,10 +12,16 @@
 #   3. Submodule update.
 #   4. Crashpad cache hygiene (handles the stale-debug-CRT corruption case).
 #   5. cmake --preset <preset>
-#   6. cmake --build build --config <Configuration>
+#   6. cmake --build build --config <Configuration> --parallel
 #   7. Copy *.dll, *.pdb under build\bin\release\ matching the plugin name
 #      into C:\builds\<plugin>\<UTC-stamp>\artifacts\.
 #   8. Return cmake's exit code.
+#
+# Logs:
+#   build.log    -- script-emitted lines (UTF-8, no BOM)
+#   console.log  -- raw cmake/msbuild output (whatever encoding the tools choose)
+#   Split into two files so my Log() and Tee-Object don't race on the same
+#   handle and so build.log stays trivially greppable.
 
 [CmdletBinding()]
 param(
@@ -29,6 +35,7 @@ param(
     [string]$Preset = 'live',
     [ValidateSet('Release','Debug','RelWithDebInfo')]
     [string]$Configuration = 'Release',
+    [int]$Parallel = 0,                # 0 => use cmake's default (= NUMBER_OF_PROCESSORS)
     [switch]$CleanReconfigure,
     [switch]$SkipSync,
     [switch]$EngineOnly
@@ -44,22 +51,35 @@ $env_ = Get-BuildEnv
 
 # Identity
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmssZ')
-$buildName = if ($EngineOnly -or -not $Plugin) { $EngineRepo } else { $Plugin }
-$buildDir  = Join-Path $env_.BuildRoot (Join-Path $buildName $stamp)
-$logFile   = Join-Path $buildDir 'build.log'
+$buildName    = if ($EngineOnly -or -not $Plugin) { $EngineRepo } else { $Plugin }
+$buildDir     = Join-Path $env_.BuildRoot (Join-Path $buildName $stamp)
+$logFile      = Join-Path $buildDir 'build.log'
+$consoleLog   = Join-Path $buildDir 'console.log'
 $artifactsDir = Join-Path $buildDir 'artifacts'
 New-Item -ItemType Directory -Path $artifactsDir -Force | Out-Null
 
+# Log writer: open-write-close per call so no persistent file handle.
+# UTF-8 no BOM via System.IO.File.AppendAllText with a no-BOM encoding instance.
+$script:_LogEnc = [System.Text.UTF8Encoding]::new($false)
 function Log {
     param([string]$Msg, [ConsoleColor]$Color = 'Gray')
     $ts = (Get-Date).ToString('HH:mm:ss')
     $line = "[$ts] $Msg"
     Write-Host $line -ForegroundColor $Color
-    Add-Content -Path $logFile -Value $line
+    [System.IO.File]::AppendAllText($logFile, $line + "`r`n", $script:_LogEnc)
+}
+
+# Redirect a native-command pipeline to console.log (Tee-Object on PS5.1
+# writes UTF-16; on pwsh 7 it defaults to UTF-8. Either is consistent within
+# a single run and stays out of build.log's way.)
+function Capture-Native {
+    param([scriptblock]$Block)
+    & $Block 2>&1 | Tee-Object -FilePath $consoleLog -Append
 }
 
 Log "=== Build $buildName preset=$Preset config=$Configuration ===" 'White'
 Log "Build dir: $buildDir"
+Log "Logs: build.log (script) + console.log (tool output)"
 
 # 1. Sync engine
 if (-not $SkipSync) {
@@ -84,7 +104,7 @@ $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 Push-Location $engineDir
 try {
-    & $env_.GitExe submodule update --init --recursive 2>&1 | Tee-Object -FilePath $logFile -Append | Out-Null
+    Capture-Native { & $env_.GitExe submodule update --init --recursive } | Out-Null
 } finally {
     Pop-Location
     $ErrorActionPreference = $prevEAP
@@ -102,6 +122,7 @@ if (Test-Path $crashpadRelLib) {
         Remove-Item -Force (Join-Path $engineDir 'build\CMakeCache.txt') -ErrorAction SilentlyContinue
     }
 }
+
 if ($CleanReconfigure) {
     Log "CleanReconfigure: removing build\CMakeCache.txt" 'Yellow'
     Remove-Item -Force (Join-Path $engineDir 'build\CMakeCache.txt') -ErrorAction SilentlyContinue
@@ -121,7 +142,7 @@ $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 Push-Location $engineDir
 try {
-    & cmake --preset $Preset 2>&1 | Tee-Object -FilePath $logFile -Append
+    Capture-Native { & cmake --preset $Preset } | Out-Null
     $cfgRc = $LASTEXITCODE
 } finally {
     Pop-Location
@@ -135,13 +156,14 @@ if ($cfgRc -ne 0) {
 Log "Configure OK (${cfgDur}s)" 'Green'
 
 # 7. Build
-Log "cmake --build build --config $Configuration" 'White'
+$parallelArgs = if ($Parallel -gt 0) { @('--parallel', $Parallel) } else { @('--parallel') }
+Log ("cmake --build build --config $Configuration " + ($parallelArgs -join ' ')) 'White'
 $tBld = Get-Date
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 Push-Location $engineDir
 try {
-    & cmake --build build --config $Configuration 2>&1 | Tee-Object -FilePath $logFile -Append
+    Capture-Native { & cmake --build build --config $Configuration @parallelArgs } | Out-Null
     $bldRc = $LASTEXITCODE
 } finally {
     Pop-Location
@@ -169,8 +191,26 @@ if ($bldRc -eq 0) {
     Log "BUILD OK  $buildName  cfg=${cfgDur}s  bld=${bldDur}s  artifacts=$artifactCount" 'Green'
 } else {
     Log "BUILD FAILED  $buildName  rc=$bldRc  bld=${bldDur}s" 'Red'
-    # Surface the first few error lines for quick triage
-    Get-Content $logFile | Select-String -Pattern 'error C\d+|error LNK\d+|FAILED|fatal error' | Select-Object -First 20 | ForEach-Object { Log "  $_" 'Red' }
+    # Surface the first few error lines for quick triage. console.log is
+    # where the cmake/msbuild output lives; check both encodings.
+    if (Test-Path $consoleLog) {
+        $bytes = [IO.File]::ReadAllBytes($consoleLog)
+        # Heuristic: if first 2 bytes look like a UTF-16 LE BOM (FF FE) or a
+        # bunch of low bytes interleaved with 00, decode as Unicode.
+        $enc = if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+            [Text.Encoding]::Unicode
+        } elseif ($bytes.Length -ge 2 -and $bytes[1] -eq 0x00) {
+            [Text.Encoding]::Unicode
+        } else {
+            [Text.Encoding]::UTF8
+        }
+        $txt = $enc.GetString($bytes)
+        ($txt -split "`r?`n") |
+            Select-String -Pattern 'error C\d+|error LNK\d+|fatal error|^FAILED' |
+            Select-Object -First 20 |
+            ForEach-Object { Log "  $($_.Line)" 'Red' }
+    }
 }
 Log "Log: $logFile"
+Log "Tool output: $consoleLog"
 exit $bldRc
